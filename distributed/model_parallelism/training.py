@@ -1,8 +1,8 @@
 from core.initialize import initialize
 from config.arguments import core_transformer_config_from_args
 from config.global_vars import get_args
-from modules.transformer_layer import TransformerLayer
-from modules.parallel_linear import ColumnParallelLinear
+from layers.transformer_layer import TransformerLayer
+from layers.parallel_linear import ColumnParallelLinear
 import torch
 from utils.enums import AttnMaskType
 

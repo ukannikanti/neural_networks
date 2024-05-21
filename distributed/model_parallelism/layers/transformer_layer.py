@@ -1,9 +1,9 @@
 import torch
 from config.transformer_config import TransformerConfig
-from modules.attention import SelfAttention
+from layers.attention import SelfAttention
 from utils.enums import AttnMaskType
 from fusions.fused_bias_dropout import get_bias_dropout_add
-from modules.mlp import MLP
+from layers.mlp import MLP
 from core import parallel_state
 
 class TransformerLayer(torch.nn.Module):

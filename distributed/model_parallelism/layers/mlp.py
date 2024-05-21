@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 from core import parallel_state
 from config.transformer_config import TransformerConfig
-from modules.parallel_linear import ColumnParallelLinear, RowParallelLinear
+from layers.parallel_linear import ColumnParallelLinear, RowParallelLinear
 from fusions.fused_bias_geglu import bias_geglu_impl
 from fusions.fused_bias_gelu import bias_gelu_impl
 from fusions.fused_bias_swiglu import bias_swiglu_impl
