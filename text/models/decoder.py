@@ -4,11 +4,29 @@ from torch import Tensor
 from torch import nn
 from torch.nn import functional as F
 from typing import Optional, Any, Union, Callable
-from attention import MultiheadAttention
+from models.attention import MultiheadAttention
 from torch.nn.modules.dropout import Dropout
 from torch.nn.modules.linear import Linear
 from torch.nn.modules.normalization import LayerNorm
 from torch.nn.modules.container import ModuleList
+
+def _generate_square_subsequent_mask(
+        sz: int,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+) -> Tensor:
+    r"""Generate a square causal mask for the sequence.
+
+    The masked positions are filled with float('-inf'). Unmasked positions are filled with float(0.0).
+    """
+    if device is None:
+        device = torch.device('cpu')
+    if dtype is None:
+        dtype = torch.float32
+    return torch.triu(
+        torch.full((sz, sz), float('-inf'), dtype=dtype, device=device),
+        diagonal=1,
+    )
 
 def _get_clones(module, N):
     # FIXME: copy.deepcopy() is not defined on nn.module
@@ -176,7 +194,7 @@ class TransformerDecoderLayer(nn.Module):
 
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int = 2048, dropout: float = 0.1,
                  activation: Union[str, Callable[[Tensor], Tensor]] = F.relu,
-                 layer_norm_eps: float = 1e-5, batch_first: bool = False, norm_first: bool = False,
+                 layer_norm_eps: float = 1e-5, batch_first: bool = True, norm_first: bool = False,
                  bias: bool = True, device=None, dtype=None) -> None:
         factory_kwargs = {'device': device, 'dtype': dtype}
         super().__init__()
@@ -208,8 +226,8 @@ class TransformerDecoderLayer(nn.Module):
         tgt: Tensor,
         memory: Tensor,
         tgt_mask: Optional[Tensor] = None,
-        memory_mask: Optional[Tensor] = None,
         tgt_key_padding_mask: Optional[Tensor] = None,
+        memory_mask: Optional[Tensor] = None,
         memory_key_padding_mask: Optional[Tensor] = None,
         tgt_is_causal: bool = False,
         memory_is_causal: bool = False,
@@ -258,7 +276,7 @@ class TransformerDecoderLayer(nn.Module):
                   attn_mask: Optional[Tensor], key_padding_mask: Optional[Tensor], is_causal: bool = False) -> Tensor:
         x = self.self_attn(x, x, x,
                            attn_mask=attn_mask,
-                           key_padding_mask=key_padding_mask,
+                           padding_mask=key_padding_mask,
                            is_causal=is_causal)[0]
         return self.dropout1(x)
 
@@ -267,7 +285,7 @@ class TransformerDecoderLayer(nn.Module):
                    attn_mask: Optional[Tensor], key_padding_mask: Optional[Tensor], is_causal: bool = False) -> Tensor:
         x = self.multihead_attn(x, mem, mem,
                                 attn_mask=attn_mask,
-                                key_padding_mask=key_padding_mask,
+                                padding_mask=key_padding_mask,
                                 is_causal=is_causal)[0]
         return self.dropout2(x)
 

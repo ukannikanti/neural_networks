@@ -3,11 +3,11 @@ from torch import Tensor
 from torch import nn
 from torch.nn import functional as F
 from typing import Optional, Any, Union, Callable
-from encoder import TransformerEncoderLayer, EncoderStacks
-from decoder import TransformerDecoderLayer, TransformerDecoder
+from models.encoder import TransformerEncoderLayer, EncoderStacks
+from models.decoder import TransformerDecoderLayer, TransformerDecoder
 from torch.nn.modules.normalization import LayerNorm
 import math
-
+import torch.optim as optim
 
 def _generate_square_subsequent_mask(
     sz: int,
@@ -27,29 +27,43 @@ def _generate_square_subsequent_mask(
         diagonal=1,
     )
 
+def _get_seq_len(src: Tensor, batch_first: bool
+) -> Optional[int]:
+    if src.is_nested:
+        return None
+    else:
+        src_size = src.size()
+        # batched: B, S, E if batch_first else S, B, E
+        seq_len_pos = 1 if batch_first else 0
+        return src_size[seq_len_pos]
 
-class PositionalEmbedding(nn.Module):
-    def __init__(self, embedding_dim, max_seq_len: int):
-        super().__init__()
-        # Compute the positional encodings once in log space.
-        pe = torch.zeros(max_seq_len, embedding_dim).float()
-        pe.require_grad = False
+class PositionalEncoding(nn.Module):
+    def __init__(self, embedding_dim: int, dropout: float = 0.05, max_seq_len: int = 5000, device = torch.device('cpu')):
+        super(PositionalEncoding, self).__init__()
+        den = torch.exp(- torch.arange(0, embedding_dim, 2)* math.log(10000) / embedding_dim)
+        pos = torch.arange(0, max_seq_len).reshape(max_seq_len, 1)
+        pos_embedding = torch.zeros((max_seq_len, embedding_dim), device)
 
-        for pos in range(max_seq_len):
-            # for each dimension of the each position
-            for i in range(0, embedding_dim, 2):
-                pe[pos, i] = math.sin(pos / (10000 ** ((2 * i) / embedding_dim)))
-                pe[pos, i + 1] = math.cos(
-                    pos / (10000 ** ((2 * (i + 1)) / embedding_dim))
-                )
+        pos_embedding[:, 0::2] = torch.sin(pos * den)
+        pos_embedding[:, 1::2] = torch.cos(pos * den)
+        
+        pos_embedding = pos_embedding.unsqueeze(-2)
+        
+        self.dropout = nn.Dropout(dropout)
+        self.register_buffer('pos_embedding', pos_embedding)
 
-        # include the batch size
-        self.pe = pe.unsqueeze(0)
+    def forward(self, token_embedding: Tensor):
+        return self.dropout(token_embedding + self.pos_embedding[:token_embedding.size(0), :])
 
-    def forward(self):
-        return self.pe
+class TokenEmbedding(nn.Module):
+    def __init__(self, vocab_size: int, emb_size: int, device = torch.device('cpu')):
+        super(TokenEmbedding, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, emb_size, device=device)
+        self.emb_size = emb_size
 
-
+    def forward(self, tokens: Tensor):
+        return self.embedding(tokens.long()) * math.sqrt(self.emb_size)
+    
 class TransformerModel(nn.Module):
     r"""A transformer model.
     Args:
@@ -72,7 +86,8 @@ class TransformerModel(nn.Module):
 
     def __init__(
         self,
-        vocab_size:int,
+        src_vocab_size:int,
+        target_vocab_size:int,
         d_model: int = 512,
         nhead: int = 8,
         num_encoder_layers: int = 6,
@@ -84,17 +99,19 @@ class TransformerModel(nn.Module):
         batch_first: bool = False,
         norm_first: bool = False,
         bias: bool = True,
-        device=None,
+        device=torch.device('cpu'),
         dtype=None,
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         torch._C._log_api_usage_once(f"torch.nn.modules.{self.__class__.__name__}")
-        # Token embedding
-        self.token_embedding = nn.Embedding(vocab_size, d_model)
         
-        # Positional enocoding
-        self.positional_embedding = PositionalEmbedding(d_model, max_seq_len=256)
+        # token embedding
+        self.src_embedding = TokenEmbedding(src_vocab_size, d_model, device=device)
+        self.tgt_embedding = TokenEmbedding(target_vocab_size, d_model, device=device)
+
+        # positional enocoding
+        self.positional_embedding = PositionalEncoding(d_model, device=device)
 
         # Encoder
         encoder_layer = TransformerEncoderLayer(
@@ -133,12 +150,13 @@ class TransformerModel(nn.Module):
         self.decoder = TransformerDecoder(
             decoder_layer, num_decoder_layers, decoder_norm
         )
+        
+        # apply linear layer to match with the target size.
+        self.linear_layer = nn.Linear(d_model, target_vocab_size)
 
         self._reset_parameters()
-
         self.d_model = d_model
         self.nhead = nhead
-
         self.batch_first = batch_first
 
     def forward(
@@ -147,109 +165,52 @@ class TransformerModel(nn.Module):
         tgt: Tensor,
         src_mask: Optional[Tensor] = None,
         tgt_mask: Optional[Tensor] = None,
+        src_padding_mask: Optional[Tensor] = None,
+        tgt_padding_mask: Optional[Tensor] = None,
         memory_mask: Optional[Tensor] = None,
-        src_key_padding_mask: Optional[Tensor] = None,
-        tgt_key_padding_mask: Optional[Tensor] = None,
-        memory_key_padding_mask: Optional[Tensor] = None,
+        memory_padding_mask: Optional[Tensor] = None,
         src_is_causal: Optional[bool] = None,
         tgt_is_causal: Optional[bool] = None,
         memory_is_causal: bool = False,
     ) -> Tensor:
-        r"""
-        Args:
-            src: the sequence to the encoder (required).
-            tgt: the sequence to the decoder (required).
-            src_mask: the additive mask for the src sequence (optional).
-            tgt_mask: the additive mask for the tgt sequence (optional).
-            memory_mask: the additive mask for the encoder output (optional).
-            src_key_padding_mask: the Tensor mask for src keys per batch (optional).
-            tgt_key_padding_mask: the Tensor mask for tgt keys per batch (optional).
-            memory_key_padding_mask: the Tensor mask for memory keys per batch (optional).
-            src_is_causal: If specified, applies a causal mask as ``src_mask``.
-                Default: ``None``; try to detect a causal mask.
-                Warning:
-                ``src_is_causal`` provides a hint that ``src_mask`` is
-                the causal mask. Providing incorrect hints can result in
-                incorrect execution, including forward and backward
-                compatibility.
-            tgt_is_causal: If specified, applies a causal mask as ``tgt_mask``.
-                Default: ``None``; try to detect a causal mask.
-                Warning:
-                ``tgt_is_causal`` provides a hint that ``tgt_mask`` is
-                the causal mask. Providing incorrect hints can result in
-                incorrect execution, including forward and backward
-                compatibility.
-            memory_is_causal: If specified, applies a causal mask as
-                ``memory_mask``.
-                Default: ``False``.
-                Warning:
-                ``memory_is_causal`` provides a hint that
-                ``memory_mask`` is the causal mask. Providing incorrect
-                hints can result in incorrect execution, including
-                forward and backward compatibility.
-
-        Shape:
-            - src: :math:`(S, E)` for unbatched input, :math:`(S, N, E)` if `batch_first=False` or
-              `(N, S, E)` if `batch_first=True`.
-            - tgt: :math:`(T, E)` for unbatched input, :math:`(T, N, E)` if `batch_first=False` or
-              `(N, T, E)` if `batch_first=True`.
-            - src_mask: :math:`(S, S)` or :math:`(N\cdot\text{num\_heads}, S, S)`.
-            - tgt_mask: :math:`(T, T)` or :math:`(N\cdot\text{num\_heads}, T, T)`.
-            - memory_mask: :math:`(T, S)`.
-            - src_key_padding_mask: :math:`(S)` for unbatched input otherwise :math:`(N, S)`.
-            - tgt_key_padding_mask: :math:`(T)` for unbatched input otherwise :math:`(N, T)`.
-            - memory_key_padding_mask: :math:`(S)` for unbatched input otherwise :math:`(N, S)`.
-
-            Note: [src/tgt/memory]_mask ensures that position :math:`i` is allowed to attend the unmasked
-            positions. If a BoolTensor is provided, positions with ``True``
-            are not allowed to attend while ``False`` values will be unchanged. If a FloatTensor
-            is provided, it will be added to the attention weight.
-            [src/tgt/memory]_key_padding_mask provides specified elements in the key to be ignored by
-            the attention. If a BoolTensor is provided, the positions with the
-            value of ``True`` will be ignored while the position with the value of ``False`` will be unchanged.
-
-            - output: :math:`(T, E)` for unbatched input, :math:`(T, N, E)` if `batch_first=False` or
-              `(N, T, E)` if `batch_first=True`.
-
-            Note: Due to the multi-head attention architecture in the transformer model,
-            the output sequence length of a transformer is same as the input sequence
-            (i.e. target) length of the decoder.
-
-            where :math:`S` is the source sequence length, :math:`T` is the target sequence length, :math:`N` is the
-            batch size, :math:`E` is the feature number
-
-        Examples:
-            >>> # xdoctest: +SKIP
-            >>> output = transformer_model(src, tgt, src_mask=src_mask, tgt_mask=tgt_mask)
-        """
+        
+        # check batch shapes
         is_batched = src.dim() == 3
         if not self.batch_first and src.size(1) != tgt.size(1) and is_batched:
             raise RuntimeError("the batch number of src and tgt must be equal")
         elif self.batch_first and src.size(0) != tgt.size(0) and is_batched:
             raise RuntimeError("the batch number of src and tgt must be equal")
-
-        src_embeddings = self.token_embedding(src) + self.positional_embedding()
-        tgt_embeddings = self.token_embedding(tgt) + self.positional_embedding()
         
+        # embeddings to convert the input tokens and output tokens to vectors of dimension d_model
+        src_embeddings = self.positional_embedding(self.src_embedding(src))
+        tgt_embeddings = self.positional_embedding(self.tgt_embedding(tgt)) 
+
+        # check the d_model shape for src & tgt
+        if src_embeddings.size(-1) != self.d_model or tgt_embeddings.size(-1) != self.d_model:
+            raise RuntimeError("the feature number of src and tgt must be equal to d_model")
+        
+        # pass through the encoder
         encoder_output = self.encoder(
             src_embeddings,
-            mask=src_mask,
-            src_key_padding_mask=src_key_padding_mask,
+            src_mask=src_mask,
+            padding_mask=src_padding_mask,
             is_causal=src_is_causal,
         )
-
+        
+        # pass through the decoder
         decoder_output = self.decoder(
             tgt_embeddings,
             encoder_output,
             tgt_mask=tgt_mask,
             memory_mask=memory_mask,
-            tgt_key_padding_mask=tgt_key_padding_mask,
-            memory_key_padding_mask=memory_key_padding_mask,
+            tgt_key_padding_mask=tgt_padding_mask,
+            memory_key_padding_mask=memory_padding_mask,
             tgt_is_causal=tgt_is_causal,
             memory_is_causal=memory_is_causal,
         )
-
-        return decoder_output
+        
+        output = self.linear_layer(decoder_output)
+        return output
 
     @staticmethod
     def generate_square_subsequent_mask(
@@ -269,16 +230,3 @@ class TransformerModel(nn.Module):
             if p.dim() > 1:
                 torch.nn.init.xavier_uniform_(p)
 
-
-if __name__ == "__main__":
-    batch_size = 2
-    seqlen = 3
-    d_model = 8
-    nhead = 4
-
-    # model = TransformerModel(10, d_model, nhead)
-    # x = torch.rand(batch_size, seqlen)
-    # model(x, x)
-
-    emb = embedding = nn.Embedding(10, 3, padding_idx=2)
-    emb(torch.Tensor([6]))

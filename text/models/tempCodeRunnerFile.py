@@ -1,2 +1,0 @@
-
-    decoder_layer = T

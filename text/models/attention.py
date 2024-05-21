@@ -79,6 +79,8 @@ def multi_head_attention_forward(
     
     is_batched = _mha_shape_check(query, key, value, key_padding_mask, attn_mask, num_heads)
     
+    print("Input shape: ", query.shape, key.shape, value.shape)
+
     # For unbatched input, we unsqueeze at the expected batch-dim to pretend that the input
     # is batched, run the computation and before returning squeeze the
     # batch dimension so that the output doesn't carry this temporary batch dimension.
@@ -94,7 +96,6 @@ def multi_head_attention_forward(
     tgt_len, bsz, embed_dim = query.shape
     src_len, _, _ = key.shape
 
-   
     key_padding_mask = F._canonical_mask(
         mask=key_padding_mask,
         mask_name="key_padding_mask",
@@ -103,14 +104,12 @@ def multi_head_attention_forward(
         target_type=query.dtype
     )
  
-
     if is_causal and attn_mask is None:
         raise RuntimeError(
             "Need attn_mask if specifying the is_causal hint. "
             "You may use the Transformer module method "
             "`generate_square_subsequent_mask` to create this mask."
         )
-
     
     attn_mask = F._canonical_mask(
             mask=attn_mask,
@@ -133,7 +132,6 @@ def multi_head_attention_forward(
     else:
         head_dim = embed_dim // num_heads
     
-   
     assert head_dim * num_heads == embed_dim, f"embed_dim {embed_dim} not divisible by num_heads {num_heads}"
     assert key.shape == value.shape, f"key shape {key.shape} does not match value shape {value.shape}"
 
@@ -142,9 +140,10 @@ def multi_head_attention_forward(
     #
     assert in_proj_weight is not None, "use_separate_proj_weight is False but in_proj_weight is None"
     q, k, v = F._in_projection_packed(query, key, value, in_proj_weight, in_proj_bias)
+
+    print("After shape: ", q.shape, k.shape, v.shape)
     
     # prep attention mask
-
     if attn_mask is not None:
         # ensure attn_mask's dim is 3
         if attn_mask.dim() == 2:
@@ -190,7 +189,7 @@ def multi_head_attention_forward(
 
     # update source sequence length after adjustments
     src_len = k.size(1)
-
+    
     # merge key padding and attention masks
     if key_padding_mask is not None:
         assert key_padding_mask.shape == (bsz, src_len), \
@@ -220,11 +219,12 @@ def multi_head_attention_forward(
     
     q = q.view(bsz, num_heads, tgt_len, head_dim)
     k = k.view(bsz, num_heads, src_len, head_dim)
-    v = v.view(bsz, num_heads, src_len, head_dim)
+    v = v.view(bsz, num_heads, src_len, head_dim)   
+    
     attn_output = torch._C._nn.scaled_dot_product_attention(q, k, v, attn_mask, dropout_p, is_causal)
-        
+    
     attn_output = attn_output.permute(2, 0, 1, 3).contiguous().view(bsz * tgt_len, embed_dim)
-
+ 
     attn_output = torch._C._nn.linear(attn_output, out_proj_weight, out_proj_bias)
     attn_output = attn_output.view(tgt_len, bsz, attn_output.size(1))
     if not is_batched:
@@ -232,12 +232,11 @@ def multi_head_attention_forward(
         attn_output = attn_output.squeeze(1)
     return attn_output, None
 
-
 class MultiheadAttention(Module):
     bias_k: Optional[torch.Tensor]
     bias_v: Optional[torch.Tensor]
 
-    def __init__(self, embed_dim, num_heads, dropout=0., bias=True, add_bias_kv=False, add_zero_attn=False,
+    def __init__(self, embed_dim, num_heads, dropout=0.01, bias=True, add_bias_kv=False, add_zero_attn=False,
                  kdim=None, vdim=None, batch_first=False, device=None, dtype=None) -> None:
         if embed_dim <= 0 or num_heads <= 0:
             raise ValueError(
@@ -254,6 +253,7 @@ class MultiheadAttention(Module):
         self.num_heads = num_heads
         self.dropout = dropout
         self.batch_first = batch_first
+
         self.head_dim = embed_dim // num_heads
         assert self.head_dim * num_heads == self.embed_dim, "embed_dim must be divisible by num_heads"
 
@@ -263,6 +263,7 @@ class MultiheadAttention(Module):
             self.in_proj_bias = Parameter(torch.empty(3 * embed_dim, **factory_kwargs))
         else:
             self.register_parameter('in_proj_bias', None)
+
         self.out_proj = NonDynamicallyQuantizableLinear(embed_dim, embed_dim, bias=bias, **factory_kwargs)
 
         if add_bias_kv:
@@ -303,15 +304,15 @@ class MultiheadAttention(Module):
             query: Tensor,
             key: Tensor,
             value: Tensor,
-            key_padding_mask: Optional[Tensor] = None,
+            padding_mask: Optional[Tensor] = None,
             attn_mask: Optional[Tensor] = None,
             is_causal : bool = False) -> Tuple[Tensor, Optional[Tensor]]:
 
         is_batched = query.dim() == 3
 
-        key_padding_mask = F._canonical_mask(
-            mask=key_padding_mask,
-            mask_name="key_padding_mask",
+        padding_mask = F._canonical_mask(
+            mask=padding_mask,
+            mask_name="padding_mask",
             other_type=F._none_or_dtype(attn_mask),
             other_name="attn_mask",
             target_type=query.dtype
@@ -336,14 +337,14 @@ class MultiheadAttention(Module):
                     value = key
             else:
                 query, key, value = (x.transpose(1, 0) for x in (query, key, value))
-        
+       
         attn_output, attn_output_weights = multi_head_attention_forward(
                 query, key, value, self.embed_dim, self.num_heads,
                 self.in_proj_weight, self.in_proj_bias,
                 self.bias_k, self.bias_v, self.add_zero_attn,
                 self.dropout, self.out_proj.weight, self.out_proj.bias,
                 training=self.training,
-                key_padding_mask=key_padding_mask, 
+                key_padding_mask=padding_mask, 
                 attn_mask=attn_mask,
                 is_causal=is_causal)
 
@@ -393,3 +394,7 @@ class MultiheadAttention(Module):
 
         # no attn_mask and no key_padding_mask, returns None, None
         return merged_mask, mask_type
+
+m = MultiheadAttention(64, 8)
+output = m.forward(torch.rand(1, 64), torch.rand(1, 64), torch.rand(1, 64))
+print("Output shape: ", output[0].shape)
